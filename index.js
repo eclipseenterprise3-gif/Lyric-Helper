@@ -1,7 +1,15 @@
 // AstroRP Payout Bot — weekly payout tabs
 
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder } from 'discord.js';
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  REST,
+  Routes,
+  EmbedBuilder,
+  MessageFlags,
+} from 'discord.js';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import cron from 'cron';
