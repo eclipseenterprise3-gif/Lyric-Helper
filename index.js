@@ -331,10 +331,15 @@ client.on('interactionCreate', async function (i) {
   const wantEphemeral = i.commandName === 'payout-employee';
 
   try {
-    await i.deferReply({ ephemeral: wantEphemeral });
+ await i.deferReply({
+  flags: wantEphemeral ? MessageFlags.Ephemeral : undefined,
+});
+
+deferredSuccessfully = true;
   } catch (e) {
-    console.warn('deferReply failed:', e.message);
-  }
+  console.warn('deferReply failed:', e.message);
+  return;
+}
 
   try {
     if (i.commandName === 'payout') {
@@ -478,8 +483,15 @@ await sheet.addRow({
     console.error('interaction error', e);
 
     try {
-      await i.editReply({ content: 'Error processing command.' });
-    } catch (_) {}
+  if (deferredSuccessfully && (i.deferred || i.replied)) {
+    await i.editReply({
+      content: 'Error processing command.',
+      embeds: [],
+    });
+  }
+} catch (err) {
+  console.error('Failed to send interaction error:', err);
+}
   }
 });
   
