@@ -288,7 +288,8 @@ async function registerCommands() {
 });
 
 await new Promise(resolve => setTimeout(resolve, 3000));
-
+const wantEphemeral = i.commandName === 'payout-employee';
+let deferredSuccessfully = false;
 await rest.put(Routes.applicationCommands(appId), {
   body: commands,
 });
