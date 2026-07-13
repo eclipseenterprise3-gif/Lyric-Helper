@@ -209,16 +209,18 @@ async function registerCommands() {
   console.log('Slash commands registered');
 }
 
-client.on('ready', async () => {
+client.onclient.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
   try {
     await registerCommands();
   } catch (e) {
-    console.warn('Cmd reg failed (ok if not configured):', e.message);
+    console.warn('Cmd reg failed:', e.message);
   }
 
   for (const brand of BRANDS) {
     const tzName = brand.timezone || 'America/Phoenix';
+
     new cron.CronJob(
       '59 23 * * 0',
       async () => {
@@ -235,6 +237,149 @@ client.on('ready', async () => {
   }
 });
 
+client.on('interactionCreate', async (i) => {
+  if (!i.isChatInputCommand()) return;
+
+  const wantEphemeral = i.commandName === 'payout-employee';
+
+  try {
+    await i.deferReply({
+      flags: wantEphemeral ? MessageFlags.Ephemeral : undefined,
+    });
+  } catch (e) {
+    console.warn('deferReply failed:', e.code || '', e.message);
+    return;
+  }
+
+  try {
+    if (i.commandName === 'payout') {
+      const brandName = i.options.getString('brand');
+      const dateIso = i.options.getString('week_start_iso');
+
+      const brand = BRANDS.find(
+        b => b.name.toLowerCase() === (brandName || '').toLowerCase()
+      );
+
+      if (!brand) {
+        await i.editReply({
+          content: `Unknown brand. Available: ${BRANDS.map(b => b.name).join(', ')}`,
+        });
+        return;
+      }
+
+      const ref = dateIso
+        ? dayjsBase.tz(dateIso, brand.timezone)
+        : dayjsBase.tz(new Date(), brand.timezone);
+
+      const { start, end } = weekWindow(
+        ref,
+        brand.week_start || 'sun',
+        brand.timezone
+      );
+
+      const out = await buildWeeklySummary(brand, start, end);
+
+      await i.editReply({
+        embeds: [out.embed],
+      });
+
+      return;
+    }
+
+    if (i.commandName === 'payout-employee') {
+      const brandName = i.options.getString('brand');
+      const emp = i.options.getString('employee');
+      const dateIso = i.options.getString('week_start_iso');
+
+      const brand = BRANDS.find(
+        b => b.name.toLowerCase() === (brandName || '').toLowerCase()
+      );
+
+      if (!brand) {
+        await i.editReply({
+          content: 'Unknown brand.',
+        });
+        return;
+      }
+
+      const ref = dateIso
+        ? dayjsBase.tz(dateIso, brand.timezone)
+        : dayjsBase.tz(new Date(), brand.timezone);
+
+      const { start, end } = weekWindow(
+        ref,
+        brand.week_start || 'sun',
+        brand.timezone
+      );
+
+      const store = storeFor(brand.sheet_id);
+
+      const rows = await store.fetchRange(
+        brand.name,
+        start.valueOf(),
+        end.valueOf()
+      );
+
+      const mine = rows.filter(
+        r =>
+          (r.invoiced_by || '').toLowerCase() ===
+          (emp || '').toLowerCase()
+      );
+
+      const total = mine.reduce(
+        (sum, row) => sum + (row.amount || 0),
+        0
+      );
+
+      const sorted = mine
+        .slice()
+        .sort((a, b) => b.ts_epoch - a.ts_epoch);
+
+      const lines = sorted.slice(0, 20).map(r => {
+        const when = dayjsBase
+          .tz(r.ts_iso, brand.timezone)
+          .format('MM/DD HH:mm');
+
+        return (
+          `• ${when} — ${fmt(r.amount)} — ${r.job_name || ''}` +
+          (r.memo ? ` — ${r.memo}` : '')
+        );
+      });
+
+      const endIncl = end.subtract(1, 'day');
+
+      const content =
+        `${brand.name} | ${emp} | ` +
+        `${start.format('MM/DD')}–${endIncl.format('MM/DD')} ` +
+        `(${brand.timezone})\n` +
+        `Total: ${fmt(total)}\n\n` +
+        (lines.join('\n') || '_no rows_');
+
+      await i.editReply({
+        content,
+      });
+
+      return;
+    }
+
+    await i.editReply({
+      content: 'Unknown command.',
+    });
+  } catch (e) {
+    console.error('interaction error:', e);
+
+    try {
+      if (i.deferred || i.replied) {
+        await i.editReply({
+          content: 'Error processing command.',
+          embeds: [],
+        });
+      }
+    } catch (replyError) {
+      console.error('Failed to send error response:', replyError);
+    }
+  }
+});
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
   const wantEphemeral = i.commandName === 'payout-employee';
