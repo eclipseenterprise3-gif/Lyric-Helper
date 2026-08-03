@@ -56,9 +56,21 @@ for (const brand of BRANDS) {
     );
   }
   brand.timezone ||= 'America/Phoenix';
-  brand.week_start = String(brand.week_start || 'sun').toLowerCase();
-  if (!['sun', 'mon'].includes(brand.week_start)) {
-    throw new Error(`${brand.name}: week_start must be "sun" or "mon"`);
+  const weekStartValue = String(brand.week_start ?? 'sun').trim().toLowerCase();
+  const weekStartAliases = {
+    sun: 'sun',
+    sunday: 'sun',
+    '0': 'sun',
+    mon: 'mon',
+    monday: 'mon',
+    '1': 'mon',
+  };
+  brand.week_start = weekStartAliases[weekStartValue];
+  if (!brand.week_start) {
+    console.warn(
+      `${brand.name}: unrecognized week_start "${weekStartValue}"; defaulting to Sunday`
+    );
+    brand.week_start = 'sun';
   }
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: brand.timezone }).format();
