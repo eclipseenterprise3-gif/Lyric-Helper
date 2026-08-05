@@ -355,7 +355,7 @@ function paycheckRateFor(brand) {
     brand.paycheck_percentage ??
     brand.paycheck_percent ??
     process.env.PAYCHECK_PERCENTAGE ??
-    40;
+    20;
   return percentageRate(configured, 'paycheck percentage', brand);
 }
 
