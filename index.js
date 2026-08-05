@@ -346,7 +346,7 @@ function commissionRateFor(brand) {
     brand.payout_percent ??
     process.env.COMMISSION_PERCENTAGE ??
     process.env.PAYOUT_PERCENTAGE ??
-    40;
+    45;
   return percentageRate(configured, 'commission percentage', brand);
 }
 
@@ -355,7 +355,7 @@ function paycheckRateFor(brand) {
     brand.paycheck_percentage ??
     brand.paycheck_percent ??
     process.env.PAYCHECK_PERCENTAGE ??
-    20;
+    40;
   return percentageRate(configured, 'paycheck percentage', brand);
 }
 
