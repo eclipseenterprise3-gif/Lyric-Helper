@@ -254,7 +254,7 @@ class SheetStore {
 
   async payrollStatusSheet(brand) {
     await this.init();
-    const title = safeSheetTitle(`${brand.name}__Payroll_Status`);
+    const title = 'Payroll_Status';
     const headers = ['week_start', 'brand', 'employee', 'employee_key', 'paycheck', 'status', 'changed_by', 'changed_at'];
     let sheet = this.doc.sheetsByTitle[title];
     if (!sheet) sheet = await this.doc.addSheet({ title, headerValues: headers });
@@ -270,9 +270,11 @@ class SheetStore {
     const sheet = await this.payrollStatusSheet(brand);
     const rows = await sheet.getRows();
     const wantedWeek = weekStart.format('YYYY-MM-DD');
+    const wantedBrand = brand.name.trim().toLowerCase();
     const paid = new Set();
     for (const row of rows) {
       if (String(row.get('week_start')) !== wantedWeek) continue;
+      if (String(row.get('brand') || '').trim().toLowerCase() !== wantedBrand) continue;
       const key = String(row.get('employee_key') || '').trim().toLowerCase();
       if (!key) continue;
       const status = String(row.get('status') || 'paid').trim().toLowerCase();
@@ -287,6 +289,12 @@ const stores = new Map();
 function storeFor(sheetId) {
   if (!stores.has(sheetId)) stores.set(sheetId, new SheetStore(sheetId));
   return stores.get(sheetId);
+}
+
+// Set PAYROLL_SHEET_ID to keep every brand's payroll records in one workbook.
+// If it is omitted, payroll continues using each brand's regular spreadsheet.
+function payrollStoreFor(brand) {
+  return storeFor(process.env.PAYROLL_SHEET_ID || brand.sheet_id);
 }
 
 function hasPaidEmbed(embed) {
@@ -355,7 +363,7 @@ function paycheckRateFor(brand) {
     brand.paycheck_percentage ??
     brand.paycheck_percent ??
     process.env.PAYCHECK_PERCENTAGE ??
-    20;
+    40;
   return percentageRate(configured, 'paycheck percentage', brand);
 }
 
@@ -395,7 +403,7 @@ async function buildFinalPayEmbeds(brand, start, end) {
   const commissionRate = commissionRateFor(brand);
   const paycheckRate = paycheckRateFor(brand);
   const employees = groupPayoutsByEmployee(rows, commissionRate, paycheckRate);
-  const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+  const paidKeys = await payrollStoreFor(brand).paidEmployeeKeys(brand, start);
   const pages = [];
   for (let index = 0; index < employees.length; index += 18) {
     pages.push(employees.slice(index, index + 18));
@@ -450,7 +458,7 @@ async function buildFinalPayEmbeds(brand, start, end) {
 async function buildPaidChecklistComponents(brand, brandIndex, start, end) {
   const rows = await storeFor(brand.sheet_id).fetchRange(brand, start.valueOf(), end.valueOf());
   const employees = groupPayoutsByEmployee(rows, commissionRateFor(brand), paycheckRateFor(brand));
-  const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+  const paidKeys = await payrollStoreFor(brand).paidEmployeeKeys(brand, start);
   const unpaid = employees.filter(item => !paidKeys.has(employeeKey(item.employee))).slice(0, 25);
   const paid = employees.filter(item => paidKeys.has(employeeKey(item.employee))).slice(0, 25);
   const components = [];
@@ -843,7 +851,7 @@ client.on('interactionCreate', async interaction => {
     const { start, end } = weekWindow(dayjs().tz(brand.timezone), brand.week_start, brand.timezone);
     const rows = await storeFor(brand.sheet_id).fetchRange(brand, start.valueOf(), end.valueOf());
     const employees = groupPayoutsByEmployee(rows, commissionRateFor(brand), paycheckRateFor(brand));
-    const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+    const paidKeys = await payrollStoreFor(brand).paidEmployeeKeys(brand, start);
     const unpaid = employees.filter(item => !paidKeys.has(employeeKey(item.employee))).slice(0, 25);
 
     if (!unpaid.length) {
@@ -894,7 +902,7 @@ client.on('interactionCreate', async interaction => {
     );
     const rows = await storeFor(brand.sheet_id).fetchRange(brand, start.valueOf(), end.valueOf());
     const employees = groupPayoutsByEmployee(rows, commissionRateFor(brand), paycheckRateFor(brand));
-    const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+    const paidKeys = await payrollStoreFor(brand).paidEmployeeKeys(brand, start);
     const settingPaid = action === 'payroll-set-paid';
     const availableEmployees = employees
       .filter(item => paidKeys.has(employeeKey(item.employee)) !== settingPaid)
@@ -902,7 +910,7 @@ client.on('interactionCreate', async interaction => {
     const selected = interaction.values
       .map(value => availableEmployees[Number(value)])
       .filter(Boolean);
-    const sheet = await storeFor(brand.sheet_id).payrollStatusSheet(brand);
+    const sheet = await payrollStoreFor(brand).payrollStatusSheet(brand);
     const changedAt = new Date().toISOString();
     for (const item of selected) {
       const key = employeeKey(item.employee);
