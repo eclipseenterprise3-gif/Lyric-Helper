@@ -56,22 +56,8 @@ for (const brand of BRANDS) {
     );
   }
   brand.timezone ||= 'America/Phoenix';
-  const weekStartValue = String(brand.week_start ?? 'sun').trim().toLowerCase();
-  const weekStartAliases = {
-    sun: 'sun',
-    sunday: 'sun',
-    '0': 'sun',
-    mon: 'mon',
-    monday: 'mon',
-    '1': 'mon',
-  };
-  brand.week_start = weekStartAliases[weekStartValue];
-  if (!brand.week_start) {
-    console.warn(
-      `${brand.name}: unrecognized week_start "${weekStartValue}"; defaulting to Sunday`
-    );
-    brand.week_start = 'sun';
-  }
+  // Payout weeks always roll over on Saturday for every brand.
+  brand.week_start = 'sat';
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: brand.timezone }).format();
   } catch {
@@ -87,7 +73,8 @@ function weekWindow(reference, startOn = 'sun', tzName = 'America/Phoenix') {
   if (!local.isValid()) throw new Error(`Invalid date: ${reference}`);
 
   const weekday = local.day();
-  const offset = startOn === 'mon' ? (weekday === 0 ? 6 : weekday - 1) : weekday;
+  const startDay = { sun: 0, mon: 1, sat: 6 }[startOn] ?? 0;
+  const offset = (weekday - startDay + 7) % 7;
   const start = local.startOf('day').subtract(offset, 'day');
   return { start, end: start.add(7, 'day'), tz: tzName };
 }
@@ -197,6 +184,24 @@ class SheetStore {
       }];
     });
   }
+
+  async raffleSheet(brand) {
+    await this.init();
+    const title = safeSheetTitle(`${brand.name}__Raffle`);
+    const headers = [
+      'ts_iso',
+      'ts_epoch',
+      'brand',
+      'seller_name',
+      'seller_id',
+      'buyer_name',
+      'tickets',
+    ];
+    let sheet = this.doc.sheetsByTitle[title];
+    if (!sheet) sheet = await this.doc.addSheet({ title, headerValues: headers });
+    else await sheet.loadHeaderRow(1);
+    return sheet;
+  }
 }
 
 const stores = new Map();
@@ -264,9 +269,8 @@ const client = new Client({
 const commands = [
   {
     name: 'payout',
-    description: 'Show weekly payout totals',
+    description: 'Show weekly payout totals for all brands',
     options: [
-      { name: 'brand', description: 'Brand name', type: 3, required: true },
       { name: 'week_start_iso', description: 'Any ISO date in the week', type: 3 },
     ],
   },
@@ -279,6 +283,21 @@ const commands = [
       { name: 'week_start_iso', description: 'Any ISO date in the week', type: 3 },
     ],
   },
+  {
+    name: 'raffle',
+    description: 'Log raffle tickets',
+    options: [
+      { name: 'brand', description: 'Brand name', type: 3, required: true },
+      { name: 'buyer', description: 'Buyer name', type: 3, required: true },
+      {
+        name: 'tickets',
+        description: 'Number of tickets',
+        type: 4,
+        required: true,
+        min_value: 1,
+      },
+    ],
+  },
 ];
 
 async function registerCommands() {
@@ -287,11 +306,21 @@ async function registerCommands() {
     return;
   }
   const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
-  await rest.put(Routes.applicationCommands(process.env.APPLICATION_ID), { body: commands });
-  console.log('Slash commands registered');
+  const route = process.env.GUILD_ID
+    ? Routes.applicationGuildCommands(process.env.APPLICATION_ID, process.env.GUILD_ID)
+    : Routes.applicationCommands(process.env.APPLICATION_ID);
+
+  // PUT replaces the existing command definitions, removing the old required
+  // brand option from /payout. Guild commands update immediately.
+  await rest.put(route, { body: commands });
+  console.log(
+    process.env.GUILD_ID
+      ? `Slash commands registered for guild ${process.env.GUILD_ID}`
+      : 'Global slash commands registered'
+  );
 }
 
-async function buildWeeklySummary(brand, start, end) {
+async function buildWeeklySummaryLegacy(brand, start, end) {
   const rows = await storeFor(brand.sheet_id).fetchRange(
     brand,
     start.valueOf(),
@@ -324,10 +353,63 @@ async function buildWeeklySummary(brand, start, end) {
   return { embed, grand };
 }
 
+async function buildWeeklySummary(brand, start, end) {
+  const rows = await storeFor(brand.sheet_id).fetchRange(
+    brand,
+    start.valueOf(),
+    end.valueOf()
+  );
+
+  const byEmployee = new Map();
+  for (const row of rows) {
+    const employee = String(row.invoiced_by || 'UNKNOWN').trim() || 'UNKNOWN';
+    const current = byEmployee.get(employee) || { total: 0, sales: 0 };
+    current.total += row.amount;
+    current.sales += 1;
+    byEmployee.set(employee, current);
+  }
+
+  const sorted = [...byEmployee.entries()].sort(
+    (a, b) => b[1].total - a[1].total
+  );
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines = sorted.slice(0, 20).map(([employee, stats], index) => {
+    const rank = medals[index] || `**${index + 1}.**`;
+    const salesLabel = stats.sales === 1 ? 'sale' : 'sales';
+    return `${rank} **${employee}** — ${fmt(stats.total)} · ${stats.sales} ${salesLabel}`;
+  });
+
+  const grand = rows.reduce((sum, row) => sum + row.amount, 0);
+  const averageSale = rows.length ? grand / rows.length : 0;
+  const endInclusive = end.subtract(1, 'day');
+
+  const embed = new EmbedBuilder()
+    .setColor(brand.embed_color || 0x5865f2)
+    .setTitle(`💰 ${brand.name} Weekly Payouts`)
+    .setDescription(
+      `**${start.format('MMMM D')} – ${endInclusive.format('MMMM D, YYYY')}**\n` +
+      `Saturday–Friday · ${brand.timezone}`
+    )
+    .addFields(
+      { name: '🏆 Payout Leaderboard', value: limitEmbedText(lines) },
+      { name: '💵 Grand Total', value: `**${fmt(grand)}**`, inline: true },
+      { name: '🧾 Sales', value: `**${rows.length.toLocaleString('en-US')}**`, inline: true },
+      { name: '📊 Average Sale', value: `**${fmt(averageSale)}**`, inline: true }
+    )
+    .setFooter({
+      text: `${sorted.length} employee${sorted.length === 1 ? '' : 's'} · New week starts Saturday`,
+    })
+    .setTimestamp(new Date());
+
+  return { embed, grand };
+}
+
 async function postWeeklySummary(brand) {
   const channel = await client.channels.fetch(brand.payouts_channel_id);
   if (!channel?.isTextBased()) throw new Error('Payout channel is not text based');
-  const { start, end } = weekWindow(new Date(), brand.week_start, brand.timezone);
+  const now = dayjs().tz(brand.timezone);
+  // At Saturday rollover, select the completed Saturday-through-Friday week.
+  const { start, end } = weekWindow(now.subtract(1, 'day'), 'sat', brand.timezone);
   const { embed } = await buildWeeklySummary(brand, start, end);
   await channel.send({ embeds: [embed] });
 }
@@ -341,10 +423,9 @@ client.once('clientReady', async () => {
   }
 
   for (const brand of BRANDS) {
-    // Sunday-start weeks end Saturday; Monday-start weeks end Sunday.
-    const closingDay = brand.week_start === 'mon' ? 0 : 6;
+    // Post at 12:01 AM Saturday, just after the new week begins.
     new CronJob(
-      `59 23 * * ${closingDay}`,
+      '1 0 * * 6',
       () => postWeeklySummary(brand).catch(error => {
         console.error('Weekly post error', brand.name, error);
       }),
@@ -358,11 +439,38 @@ client.once('clientReady', async () => {
 // Intentionally one interactionCreate handler so every command is acknowledged once.
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-  if (!['payout', 'payout-employee'].includes(interaction.commandName)) return;
+  if (!['payout', 'payout-employee', 'raffle'].includes(interaction.commandName)) return;
 
   const ephemeral = interaction.commandName === 'payout-employee';
   try {
     await interaction.deferReply({ flags: ephemeral ? MessageFlags.Ephemeral : undefined });
+
+    if (interaction.commandName === 'payout') {
+      const dateIso = interaction.options.getString('week_start_iso');
+      const embeds = [];
+
+      for (const payoutBrand of BRANDS) {
+        const reference = parseReference(dateIso, payoutBrand);
+        const { start, end } = weekWindow(
+          reference,
+          payoutBrand.week_start,
+          payoutBrand.timezone
+        );
+        const { embed } = await buildWeeklySummary(payoutBrand, start, end);
+        embeds.push(embed);
+      }
+
+      // Discord permits at most 10 embeds per message.
+      const chunks = [];
+      for (let index = 0; index < embeds.length; index += 10) {
+        chunks.push(embeds.slice(index, index + 10));
+      }
+      await interaction.editReply({ embeds: chunks.shift() || [] });
+      for (const chunk of chunks) {
+        await interaction.followUp({ embeds: chunk });
+      }
+      return;
+    }
 
     const brandName = interaction.options.getString('brand');
     const brand = findBrand(brandName);
@@ -373,17 +481,34 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
+    if (interaction.commandName === 'raffle') {
+      const buyer = interaction.options.getString('buyer', true).trim();
+      const tickets = interaction.options.getInteger('tickets', true);
+      const timestamp = dayjs().tz(brand.timezone);
+      const raffleSheet = await storeFor(brand.sheet_id).raffleSheet(brand);
+      const sellerName = interaction.member?.displayName || interaction.user.globalName ||
+        interaction.user.username;
+
+      await raffleSheet.addRow({
+        ts_iso: timestamp.toISOString(),
+        ts_epoch: timestamp.valueOf(),
+        brand: brand.name,
+        seller_name: sellerName,
+        seller_id: interaction.user.id,
+        buyer_name: buyer,
+        tickets,
+      });
+      await interaction.editReply({
+        content: `Logged ${tickets} raffle ticket(s) for “${buyer}” under ${brand.name}.`,
+      });
+      return;
+    }
+
     const reference = parseReference(
       interaction.options.getString('week_start_iso'),
       brand
     );
     const { start, end } = weekWindow(reference, brand.week_start, brand.timezone);
-
-    if (interaction.commandName === 'payout') {
-      const { embed } = await buildWeeklySummary(brand, start, end);
-      await interaction.editReply({ embeds: [embed] });
-      return;
-    }
 
     const requestedEmployee = interaction.options.getString('employee', true).trim();
     const rows = await storeFor(brand.sheet_id).fetchRange(
