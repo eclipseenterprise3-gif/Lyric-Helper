@@ -405,6 +405,8 @@ async function buildFinalPayEmbeds(brand, start, end) {
   const grossTotal = employees.reduce((sum, item) => sum + item.gross, 0);
   const commissionTotal = employees.reduce((sum, item) => sum + item.commission, 0);
   const paycheckTotal = employees.reduce((sum, item) => sum + item.paycheck, 0);
+  // The business keeps the part of its commission that is not paid as payroll.
+  const businessMade = commissionTotal - paycheckTotal;
   const paidCount = employees.filter(item => paidKeys.has(employeeKey(item.employee))).length;
   const endInclusive = end.subtract(1, 'day');
 
@@ -416,6 +418,7 @@ async function buildFinalPayEmbeds(brand, start, end) {
         `💵 **Payroll ${fmt(paycheckTotal)}**  •  ` +
         `**${paidCount} of ${employees.length} paid**\n` +
         `Sales ${fmt(grossTotal)}  •  Commission ${fmt(commissionTotal)}\n` +
+        `🏦 **Business Made ${fmt(businessMade)}**\n` +
         `${percentageLabel(commissionRate)} commission → ` +
         `${percentageLabel(paycheckRate)} paycheck  •  Saturday–Friday`
       )
