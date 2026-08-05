@@ -1,3 +1,4 @@
+// PAYOUT BOT BUILD: OPTION-B-COMPACT-UI
 import 'dotenv/config';
 import {
   Client,
@@ -7,6 +8,14 @@ import {
   Routes,
   EmbedBuilder,
   MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  PermissionFlagsBits,
+  StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from 'discord.js';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
@@ -202,6 +211,76 @@ class SheetStore {
     else await sheet.loadHeaderRow(1);
     return sheet;
   }
+
+  async reimbursementSheet(brand) {
+    await this.init();
+    const title = safeSheetTitle(`${brand.name}__Reimbursements`);
+    const headers = ['ts_iso', 'ts_epoch', 'brand', 'logged_by', 'logged_by_id', 'employee', 'item', 'quantity', 'unit_price', 'amount', 'notes'];
+
+    let sheet = this.doc.sheetsByTitle[title];
+    if (!sheet) sheet = await this.doc.addSheet({ title, headerValues: headers });
+    else {
+      await sheet.loadHeaderRow(1);
+      const missing = headers.filter(header => !sheet.headerValues.includes(header));
+      if (missing.length) await sheet.setHeaderRow([...sheet.headerValues, ...missing]);
+    }
+    return sheet;
+  }
+
+  async reimbursementItemsSheet(brand) {
+    await this.init();
+    const title = safeSheetTitle(`${brand.name}__Reimbursement_Items`);
+    const headers = ['item_name', 'unit_price', 'active', 'added_by', 'added_at'];
+    let sheet = this.doc.sheetsByTitle[title];
+    if (!sheet) sheet = await this.doc.addSheet({ title, headerValues: headers });
+    else {
+      await sheet.loadHeaderRow(1);
+      const missing = headers.filter(header => !sheet.headerValues.includes(header));
+      if (missing.length) await sheet.setHeaderRow([...sheet.headerValues, ...missing]);
+    }
+    return sheet;
+  }
+
+  async reimbursementItems(brand) {
+    const sheet = await this.reimbursementItemsSheet(brand);
+    const rows = await sheet.getRows();
+    return rows.flatMap(row => {
+      if (String(row.get('active') || 'true').toLowerCase() === 'false') return [];
+      const name = String(row.get('item_name') || '').trim();
+      const price = Number(String(row.get('unit_price') || '').replace(/[^0-9.-]/g, ''));
+      return name && Number.isFinite(price) ? [{ name, price }] : [];
+    });
+  }
+
+  async payrollStatusSheet(brand) {
+    await this.init();
+    const title = safeSheetTitle(`${brand.name}__Payroll_Status`);
+    const headers = ['week_start', 'brand', 'employee', 'employee_key', 'paycheck', 'status', 'changed_by', 'changed_at'];
+    let sheet = this.doc.sheetsByTitle[title];
+    if (!sheet) sheet = await this.doc.addSheet({ title, headerValues: headers });
+    else {
+      await sheet.loadHeaderRow(1);
+      const missing = headers.filter(header => !sheet.headerValues.includes(header));
+      if (missing.length) await sheet.setHeaderRow([...sheet.headerValues, ...missing]);
+    }
+    return sheet;
+  }
+
+  async paidEmployeeKeys(brand, weekStart) {
+    const sheet = await this.payrollStatusSheet(brand);
+    const rows = await sheet.getRows();
+    const wantedWeek = weekStart.format('YYYY-MM-DD');
+    const paid = new Set();
+    for (const row of rows) {
+      if (String(row.get('week_start')) !== wantedWeek) continue;
+      const key = String(row.get('employee_key') || '').trim().toLowerCase();
+      if (!key) continue;
+      const status = String(row.get('status') || 'paid').trim().toLowerCase();
+      if (status === 'unpaid') paid.delete(key);
+      else paid.add(key);
+    }
+    return paid;
+  }
 }
 
 const stores = new Map();
@@ -241,12 +320,6 @@ function findBrand(name) {
   return BRANDS.find(brand => brand.name.toLowerCase() === String(name || '').toLowerCase());
 }
 
-function parseReference(dateIso, brand) {
-  const reference = dateIso ? dayjs.tz(dateIso, brand.timezone) : dayjs().tz(brand.timezone);
-  if (!reference.isValid()) throw new Error('week_start_iso must be a valid ISO date');
-  return reference;
-}
-
 function limitEmbedText(lines, limit = 1024) {
   let text = '';
   for (const line of lines) {
@@ -255,6 +328,159 @@ function limitEmbedText(lines, limit = 1024) {
     text = next;
   }
   return text || '_no paid invoices_';
+}
+
+function percentageRate(value, label, brand) {
+  const numeric = Number(String(value).replace('%', '').trim());
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    throw new Error(`${brand.name}: ${label} must be a non-negative number`);
+  }
+  return numeric > 1 ? numeric / 100 : numeric;
+}
+
+function commissionRateFor(brand) {
+  const configured =
+    brand.commission_percentage ??
+    brand.commission_percent ??
+    brand.payout_percentage ??
+    brand.payout_percent ??
+    process.env.COMMISSION_PERCENTAGE ??
+    process.env.PAYOUT_PERCENTAGE ??
+    40;
+  return percentageRate(configured, 'commission percentage', brand);
+}
+
+function paycheckRateFor(brand) {
+  const configured =
+    brand.paycheck_percentage ??
+    brand.paycheck_percent ??
+    process.env.PAYCHECK_PERCENTAGE ??
+    20;
+  return percentageRate(configured, 'paycheck percentage', brand);
+}
+
+function percentageLabel(rate) {
+  return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(rate * 100)}%`;
+}
+
+function employeeKey(value) {
+  return String(value || 'UNKNOWN').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
+}
+
+function groupPayoutsByEmployee(rows, commissionRate, paycheckRate) {
+  const grouped = new Map();
+  for (const row of rows) {
+    const displayName = String(row.invoiced_by || 'UNKNOWN').trim().replace(/\s+/g, ' ') || 'UNKNOWN';
+    const key = employeeKey(displayName);
+    const current = grouped.get(key) || { employee: displayName, gross: 0, sales: 0 };
+    current.gross += row.amount;
+    current.sales += 1;
+    grouped.set(key, current);
+  }
+
+  return [...grouped.values()]
+    .map(item => {
+      const commission = item.gross * commissionRate;
+      return { ...item, commission, paycheck: commission * paycheckRate };
+    })
+    .sort((a, b) => b.paycheck - a.paycheck || a.employee.localeCompare(b.employee));
+}
+
+async function buildFinalPayEmbeds(brand, start, end) {
+  const rows = await storeFor(brand.sheet_id).fetchRange(
+    brand,
+    start.valueOf(),
+    end.valueOf()
+  );
+  const commissionRate = commissionRateFor(brand);
+  const paycheckRate = paycheckRateFor(brand);
+  const employees = groupPayoutsByEmployee(rows, commissionRate, paycheckRate);
+  const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+  const pages = [];
+  for (let index = 0; index < employees.length; index += 18) {
+    pages.push(employees.slice(index, index + 18));
+  }
+  if (!pages.length) pages.push([]);
+
+  const grossTotal = employees.reduce((sum, item) => sum + item.gross, 0);
+  const commissionTotal = employees.reduce((sum, item) => sum + item.commission, 0);
+  const paycheckTotal = employees.reduce((sum, item) => sum + item.paycheck, 0);
+  const paidCount = employees.filter(item => paidKeys.has(employeeKey(item.employee))).length;
+  const endInclusive = end.subtract(1, 'day');
+
+  return pages.map((pageEmployees, pageIndex) => {
+    const embed = new EmbedBuilder()
+      .setColor(employees.length > 0 && paidCount === employees.length ? 0x22c55e : (brand.embed_color || 0x7d3fd6))
+      .setTitle(`${brand.name} Payroll • ${start.format('MMM D')}–${endInclusive.format('MMM D')}`)
+      .setDescription(
+        `💵 **Payroll ${fmt(paycheckTotal)}**  •  ` +
+        `**${paidCount} of ${employees.length} paid**\n` +
+        `Sales ${fmt(grossTotal)}  •  Commission ${fmt(commissionTotal)}\n` +
+        `${percentageLabel(commissionRate)} commission → ` +
+        `${percentageLabel(paycheckRate)} paycheck  •  Saturday–Friday`
+      )
+      .setFooter({
+        text: `${employees.length} employees  •  ${rows.length} sales${pages.length > 1 ? `  •  Page ${pageIndex + 1}/${pages.length}` : ''}`,
+      })
+      .setTimestamp(new Date());
+
+    if (!pageEmployees.length) {
+      embed.addFields({ name: 'Employees', value: '_No paid sales were recorded._' });
+    } else {
+      embed.addFields(pageEmployees.map(item => {
+        const salesLabel = item.sales === 1 ? 'sale' : 'sales';
+        const isPaid = paidKeys.has(employeeKey(item.employee));
+        return {
+          name: `${isPaid ? '✅' : '◻️'} ${item.employee}  —  ${fmt(item.paycheck)}`.slice(0, 256),
+          value:
+            `${isPaid ? '**PAID**' : '**UNPAID**'}  •  ` +
+            `${item.sales} ${salesLabel}  •  Sales ${fmt(item.gross)}  •  ` +
+            `Commission ${fmt(item.commission)}`,
+          inline: false,
+        };
+      }));
+    }
+    return embed;
+  });
+}
+
+async function buildPaidChecklistComponents(brand, brandIndex, start, end) {
+  const rows = await storeFor(brand.sheet_id).fetchRange(brand, start.valueOf(), end.valueOf());
+  const employees = groupPayoutsByEmployee(rows, commissionRateFor(brand), paycheckRateFor(brand));
+  const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+  const unpaid = employees.filter(item => !paidKeys.has(employeeKey(item.employee))).slice(0, 25);
+  const paid = employees.filter(item => paidKeys.has(employeeKey(item.employee))).slice(0, 25);
+  const components = [];
+
+  if (unpaid.length) {
+    const markPaidMenu = new StringSelectMenuBuilder()
+      .setCustomId(`payroll-set-paid:${brandIndex}:${start.format('YYYY-MM-DD')}`)
+      .setPlaceholder('✅ Mark employees as paid…')
+      .setMinValues(1)
+      .setMaxValues(unpaid.length)
+      .addOptions(unpaid.map((item, index) => ({
+        label: item.employee.slice(0, 100),
+        description: `Paycheck ${fmt(item.paycheck)}`.slice(0, 100),
+        value: String(index),
+      })));
+    components.push(new ActionRowBuilder().addComponents(markPaidMenu));
+  }
+
+  if (paid.length) {
+    const markUnpaidMenu = new StringSelectMenuBuilder()
+      .setCustomId(`payroll-set-unpaid:${brandIndex}:${start.format('YYYY-MM-DD')}`)
+      .setPlaceholder('↩ Unmark paid employees…')
+      .setMinValues(1)
+      .setMaxValues(paid.length)
+      .addOptions(paid.map((item, index) => ({
+        label: item.employee.slice(0, 100),
+        description: `Paid ${fmt(item.paycheck)}`.slice(0, 100),
+        value: String(index),
+      })));
+    components.push(new ActionRowBuilder().addComponents(markUnpaidMenu));
+  }
+
+  return components;
 }
 
 const client = new Client({
@@ -270,9 +496,14 @@ const commands = [
   {
     name: 'payout',
     description: 'Show weekly payout totals for all brands',
-    options: [
-      { name: 'week_start_iso', description: 'Any ISO date in the week', type: 3 },
-    ],
+  },
+  {
+    name: 'finalpay',
+    description: 'Show final payouts for every business for a week',
+  },
+  {
+    name: 'lastweek',
+    description: 'Show payout and final-pay reports for the previous week',
   },
   {
     name: 'payout-employee',
@@ -280,8 +511,16 @@ const commands = [
     options: [
       { name: 'brand', description: 'Brand name', type: 3, required: true },
       { name: 'employee', description: 'Employee (matches invoiced_by)', type: 3, required: true },
-      { name: 'week_start_iso', description: 'Any ISO date in the week', type: 3 },
     ],
+  },
+  {
+    name: 'reimbursement',
+    description: 'Open the reimbursement logging form',
+  },
+  {
+    name: 'reimbursement-items',
+    description: 'Manage reimbursement items and prices',
+    default_member_permissions: String(PermissionFlagsBits.ManageGuild),
   },
   {
     name: 'raffle',
@@ -408,10 +647,25 @@ async function postWeeklySummary(brand) {
   const channel = await client.channels.fetch(brand.payouts_channel_id);
   if (!channel?.isTextBased()) throw new Error('Payout channel is not text based');
   const now = dayjs().tz(brand.timezone);
-  // At Saturday rollover, select the completed Saturday-through-Friday week.
-  const { start, end } = weekWindow(now.subtract(1, 'day'), 'sat', brand.timezone);
+  // Run just before Saturday rollover and close the current Saturday-Friday week.
+  const { start, end } = weekWindow(now, 'sat', brand.timezone);
   const { embed } = await buildWeeklySummary(brand, start, end);
-  await channel.send({ embeds: [embed] });
+  const finalPayEmbeds = await buildFinalPayEmbeds(brand, start, end);
+  const components = await buildPaidChecklistComponents(
+    brand,
+    BRANDS.indexOf(brand),
+    start,
+    end
+  );
+  const embeds = [embed, ...finalPayEmbeds];
+
+  // Post both reports during the same closeout. Discord allows 10 embeds per message.
+  for (let index = 0; index < embeds.length; index += 10) {
+    await channel.send({
+      embeds: embeds.slice(index, index + 10),
+      components: index === 0 ? components : [],
+    });
+  }
 }
 
 client.once('clientReady', async () => {
@@ -423,9 +677,9 @@ client.once('clientReady', async () => {
   }
 
   for (const brand of BRANDS) {
-    // Post at 12:01 AM Saturday, just after the new week begins.
+    // Post both /payout and /finalpay reports at 11:59 PM Friday, before rollover.
     new CronJob(
-      '1 0 * * 6',
+      '59 23 * * 5',
       () => postWeeklySummary(brand).catch(error => {
         console.error('Weekly post error', brand.name, error);
       }),
@@ -438,19 +692,281 @@ client.once('clientReady', async () => {
 
 // Intentionally one interactionCreate handler so every command is acknowledged once.
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-  if (!['payout', 'payout-employee', 'raffle'].includes(interaction.commandName)) return;
+  if (interaction.isStringSelectMenu() && interaction.customId === 'reimbursement-brand') {
+    const brandIndex = Number(interaction.values[0]);
+    const brand = BRANDS[brandIndex];
+    if (!brand) {
+      await interaction.update({ content: 'That business is no longer configured.', components: [] });
+      return;
+    }
 
-  const ephemeral = interaction.commandName === 'payout-employee';
+    const items = await storeFor(brand.sheet_id).reimbursementItems(brand);
+    if (!items.length) {
+      await interaction.update({
+        content: `No reimbursement items are configured for **${brand.name}**. An administrator can add them with \`/reimbursement-items\`.`,
+        components: [],
+      });
+      return;
+    }
+    const itemMenu = new StringSelectMenuBuilder()
+      .setCustomId(`reimbursement-item:${brandIndex}`)
+      .setPlaceholder('Choose an item')
+      .addOptions(items.slice(0, 25).map((item, index) => ({
+        label: item.name.slice(0, 100),
+        description: `${fmt(item.price)} each`.slice(0, 100),
+        value: String(index),
+      })));
+    await interaction.update({
+      content: `**${brand.name} Reimbursement**\nChoose an item.`,
+      components: [new ActionRowBuilder().addComponents(itemMenu)],
+    });
+    return;
+  }
+
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('reimbursement-item:')) {
+    const brandIndex = Number(interaction.customId.split(':')[1]);
+    const itemIndex = Number(interaction.values[0]);
+    const brand = BRANDS[brandIndex];
+    if (!brand) return;
+    const items = await storeFor(brand.sheet_id).reimbursementItems(brand);
+    const item = items[itemIndex];
+    if (!item) return;
+    const modal = new ModalBuilder()
+      .setCustomId(`reimbursement-modal:${brandIndex}:${itemIndex}`)
+      .setTitle(`${brand.name} Reimbursement`)
+      .addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('employee').setLabel('Employee being reimbursed').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('quantity').setLabel(`Quantity of ${item.name}`.slice(0, 45)).setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Additional notes').setStyle(TextInputStyle.Paragraph).setRequired(false))
+      );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('reimbursement-modal:')) {
+    const [, brandIndexText, itemIndexText] = interaction.customId.split(':');
+    const brand = BRANDS[Number(brandIndexText)];
+    if (!brand) return;
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const timestamp = dayjs().tz(brand.timezone);
+      const loggedBy = interaction.member?.displayName || interaction.user.globalName || interaction.user.username;
+      const sheet = await storeFor(brand.sheet_id).reimbursementSheet(brand);
+      const notes = interaction.fields.getTextInputValue('notes').trim();
+      const items = await storeFor(brand.sheet_id).reimbursementItems(brand);
+      const item = items[Number(itemIndexText)];
+      if (!item) throw new Error('That reimbursement item is no longer available');
+      const quantity = Number(interaction.fields.getTextInputValue('quantity'));
+      if (!Number.isInteger(quantity) || quantity < 1) throw new Error('Quantity must be a whole number of at least 1');
+      const amount = item.price * quantity;
+      await sheet.addRow({
+        ts_iso: timestamp.toISOString(), ts_epoch: timestamp.valueOf(), brand: brand.name,
+        logged_by: loggedBy, logged_by_id: interaction.user.id,
+        employee: interaction.fields.getTextInputValue('employee').trim(),
+        item: item.name, quantity, unit_price: item.price, amount,
+        notes,
+      });
+      await interaction.editReply(`Saved **${quantity} x ${item.name}** for **${fmt(amount)}** under **${brand.name}**.`);
+    } catch (error) {
+      console.error('Business log error:', error);
+      await interaction.editReply(`Could not save entry: ${error.message}`);
+    }
+    return;
+  }
+
+  if (interaction.isStringSelectMenu() && interaction.customId === 'reimbursement-admin-brand') {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.update({ content: 'You need the Manage Server permission.', components: [] });
+      return;
+    }
+    const brandIndex = Number(interaction.values[0]);
+    const brand = BRANDS[brandIndex];
+    if (!brand) return;
+    const button = new ButtonBuilder()
+      .setCustomId(`reimbursement-add:${brandIndex}`)
+      .setLabel('Add Reimbursement Item')
+      .setStyle(ButtonStyle.Primary);
+    await interaction.update({
+      content: `Manage reimbursement items for **${brand.name}**.`,
+      components: [new ActionRowBuilder().addComponents(button)],
+    });
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('reimbursement-add:')) {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return;
+    const brandIndex = Number(interaction.customId.split(':')[1]);
+    const brand = BRANDS[brandIndex];
+    if (!brand) return;
+    const modal = new ModalBuilder()
+      .setCustomId(`reimbursement-add-modal:${brandIndex}`)
+      .setTitle(`Add ${brand.name} Item`)
+      .addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('item_name').setLabel('Item name').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('unit_price').setLabel('Reimbursement price per item').setStyle(TextInputStyle.Short).setRequired(true))
+      );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('reimbursement-add-modal:')) {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return;
+    const brand = BRANDS[Number(interaction.customId.split(':')[1])];
+    if (!brand) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const itemName = interaction.fields.getTextInputValue('item_name').trim();
+      const price = Number(interaction.fields.getTextInputValue('unit_price').replace(/[^0-9.-]/g, ''));
+      if (!itemName || !Number.isFinite(price) || price < 0) throw new Error('Enter a valid item name and price');
+      const sheet = await storeFor(brand.sheet_id).reimbursementItemsSheet(brand);
+      await sheet.addRow({
+        item_name: itemName, unit_price: price, active: 'true',
+        added_by: interaction.user.id, added_at: new Date().toISOString(),
+      });
+      await interaction.editReply(`Added **${itemName}** at **${fmt(price)} each** for **${brand.name}**.`);
+    } catch (error) {
+      await interaction.editReply(`Could not add item: ${error.message}`);
+    }
+    return;
+  }
+
+  if (interaction.isStringSelectMenu() && interaction.customId === 'mark-paid-brand') {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return;
+    const brandIndex = Number(interaction.values[0]);
+    const brand = BRANDS[brandIndex];
+    if (!brand) return;
+    await interaction.deferUpdate();
+    const { start, end } = weekWindow(dayjs().tz(brand.timezone), brand.week_start, brand.timezone);
+    const rows = await storeFor(brand.sheet_id).fetchRange(brand, start.valueOf(), end.valueOf());
+    const employees = groupPayoutsByEmployee(rows, commissionRateFor(brand), paycheckRateFor(brand));
+    const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+    const unpaid = employees.filter(item => !paidKeys.has(employeeKey(item.employee))).slice(0, 25);
+
+    if (!unpaid.length) {
+      await interaction.editReply({
+        content: `Everyone for **${brand.name}** is already marked paid for ${start.format('MM/DD')}–${end.subtract(1, 'day').format('MM/DD')}.`,
+        components: [],
+      });
+      return;
+    }
+
+    const employeeMenu = new StringSelectMenuBuilder()
+      .setCustomId(`mark-paid-employees:${brandIndex}:${start.format('YYYY-MM-DD')}`)
+      .setPlaceholder('Select everyone being marked paid')
+      .setMinValues(1)
+      .setMaxValues(unpaid.length)
+      .addOptions(unpaid.map((item, index) => ({
+        label: item.employee.slice(0, 100),
+        description: `Paycheck ${fmt(item.paycheck)}`.slice(0, 100),
+        value: String(index),
+      })));
+    await interaction.editReply({
+      content: `**${brand.name} Payroll Checklist**\n${start.format('MMM D')}–${end.subtract(1, 'day').format('MMM D, YYYY')}\nSelect one or more employees to mark paid.`,
+      components: [new ActionRowBuilder().addComponents(employeeMenu)],
+    });
+    return;
+  }
+
+  if (
+    interaction.isStringSelectMenu() &&
+    (interaction.customId.startsWith('payroll-set-paid:') ||
+      interaction.customId.startsWith('payroll-set-unpaid:'))
+  ) {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.reply({
+        content: 'You need the Manage Server permission to mark payroll as paid.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const [action, brandIndexText, weekStartText] = interaction.customId.split(':');
+    const brand = BRANDS[Number(brandIndexText)];
+    if (!brand) return;
+    await interaction.deferUpdate();
+    const { start, end } = weekWindow(
+      dayjs.tz(weekStartText, brand.timezone),
+      brand.week_start,
+      brand.timezone
+    );
+    const rows = await storeFor(brand.sheet_id).fetchRange(brand, start.valueOf(), end.valueOf());
+    const employees = groupPayoutsByEmployee(rows, commissionRateFor(brand), paycheckRateFor(brand));
+    const paidKeys = await storeFor(brand.sheet_id).paidEmployeeKeys(brand, start);
+    const settingPaid = action === 'payroll-set-paid';
+    const availableEmployees = employees
+      .filter(item => paidKeys.has(employeeKey(item.employee)) !== settingPaid)
+      .slice(0, 25);
+    const selected = interaction.values
+      .map(value => availableEmployees[Number(value)])
+      .filter(Boolean);
+    const sheet = await storeFor(brand.sheet_id).payrollStatusSheet(brand);
+    const changedAt = new Date().toISOString();
+    for (const item of selected) {
+      const key = employeeKey(item.employee);
+      const nextStatus = settingPaid ? 'paid' : 'unpaid';
+      await sheet.addRow({
+        week_start: start.format('YYYY-MM-DD'), brand: brand.name,
+        employee: item.employee, employee_key: key, paycheck: item.paycheck,
+        status: nextStatus, changed_by: interaction.user.id, changed_at: changedAt,
+      });
+    }
+    const embeds = await buildFinalPayEmbeds(brand, start, end);
+    const components = await buildPaidChecklistComponents(
+      brand,
+      Number(brandIndexText),
+      start,
+      end
+    );
+    await interaction.editReply({ content: null, embeds: embeds.slice(0, 10), components });
+    return;
+  }
+
+  if (!interaction.isChatInputCommand()) return;
+  if (!['payout', 'finalpay', 'lastweek', 'payout-employee', 'reimbursement', 'reimbursement-items', 'raffle'].includes(interaction.commandName)) return;
+
+  const ephemeral = ['payout-employee', 'reimbursement', 'reimbursement-items']
+    .includes(interaction.commandName);
   try {
     await interaction.deferReply({ flags: ephemeral ? MessageFlags.Ephemeral : undefined });
 
+    if (interaction.commandName === 'reimbursement') {
+      const brandMenu = new StringSelectMenuBuilder()
+        .setCustomId('reimbursement-brand')
+        .setPlaceholder('Choose a business')
+        .addOptions(BRANDS.slice(0, 25).map((brand, index) => ({
+          label: brand.name.slice(0, 100),
+          value: String(index),
+        })));
+      await interaction.editReply({
+        content: '**Log a Reimbursement**\nChoose the business.',
+        components: [new ActionRowBuilder().addComponents(brandMenu)],
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'reimbursement-items') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        await interaction.editReply('You need the Manage Server permission.');
+        return;
+      }
+      const brandMenu = new StringSelectMenuBuilder()
+        .setCustomId('reimbursement-admin-brand')
+        .setPlaceholder('Choose a business')
+        .addOptions(BRANDS.slice(0, 25).map((brand, index) => ({
+          label: brand.name.slice(0, 100), value: String(index),
+        })));
+      await interaction.editReply({
+        content: '**Reimbursement Item Manager**\nChoose the business.',
+        components: [new ActionRowBuilder().addComponents(brandMenu)],
+      });
+      return;
+    }
+
     if (interaction.commandName === 'payout') {
-      const dateIso = interaction.options.getString('week_start_iso');
       const embeds = [];
 
       for (const payoutBrand of BRANDS) {
-        const reference = parseReference(dateIso, payoutBrand);
+        const reference = dayjs().tz(payoutBrand.timezone);
         const { start, end } = weekWindow(
           reference,
           payoutBrand.week_start,
@@ -468,6 +984,72 @@ client.on('interactionCreate', async interaction => {
       await interaction.editReply({ embeds: chunks.shift() || [] });
       for (const chunk of chunks) {
         await interaction.followUp({ embeds: chunk });
+      }
+      return;
+    }
+
+    if (interaction.commandName === 'finalpay') {
+      let sentFirstBusiness = false;
+
+      for (let brandIndex = 0; brandIndex < BRANDS.length; brandIndex += 1) {
+        const payoutBrand = BRANDS[brandIndex];
+        const reference = dayjs().tz(payoutBrand.timezone);
+        const { start, end } = weekWindow(
+          reference,
+          payoutBrand.week_start,
+          payoutBrand.timezone
+        );
+        const embeds = await buildFinalPayEmbeds(payoutBrand, start, end);
+        const components = await buildPaidChecklistComponents(
+          payoutBrand,
+          brandIndex,
+          start,
+          end
+        );
+        const payload = { embeds: embeds.slice(0, 10), components };
+
+        if (!sentFirstBusiness) {
+          await interaction.editReply(payload);
+          sentFirstBusiness = true;
+        } else {
+          await interaction.followUp(payload);
+        }
+        for (let index = 10; index < embeds.length; index += 10) {
+          await interaction.followUp({ embeds: embeds.slice(index, index + 10) });
+        }
+      }
+      return;
+    }
+
+    if (interaction.commandName === 'lastweek') {
+      let sentFirstBusiness = false;
+      for (let brandIndex = 0; brandIndex < BRANDS.length; brandIndex += 1) {
+        const payoutBrand = BRANDS[brandIndex];
+        const reference = dayjs().tz(payoutBrand.timezone).subtract(7, 'day');
+        const { start, end } = weekWindow(
+          reference,
+          payoutBrand.week_start,
+          payoutBrand.timezone
+        );
+        const { embed: payoutEmbed } = await buildWeeklySummary(payoutBrand, start, end);
+        const finalPayEmbeds = await buildFinalPayEmbeds(payoutBrand, start, end);
+        const embeds = [payoutEmbed, ...finalPayEmbeds];
+        const components = await buildPaidChecklistComponents(
+          payoutBrand,
+          brandIndex,
+          start,
+          end
+        );
+        const payload = { embeds: embeds.slice(0, 10), components };
+        if (!sentFirstBusiness) {
+          await interaction.editReply(payload);
+          sentFirstBusiness = true;
+        } else {
+          await interaction.followUp(payload);
+        }
+        for (let index = 10; index < embeds.length; index += 10) {
+          await interaction.followUp({ embeds: embeds.slice(index, index + 10) });
+        }
       }
       return;
     }
@@ -504,10 +1086,7 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    const reference = parseReference(
-      interaction.options.getString('week_start_iso'),
-      brand
-    );
+    const reference = dayjs().tz(brand.timezone);
     const { start, end } = weekWindow(reference, brand.week_start, brand.timezone);
 
     const requestedEmployee = interaction.options.getString('employee', true).trim();
